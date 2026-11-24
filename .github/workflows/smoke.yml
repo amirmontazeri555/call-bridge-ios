@@ -1,0 +1,14 @@
+name: Smoke test (linux)
+on:
+  push:
+    branches: [main]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check project files
+        run: |
+          ls -la
+          cat CallBridge/project.yml
+          python3 -c "import yaml,sys; yaml.safe_load(open('CallBridge/project.yml')); print('project.yml valid')"
