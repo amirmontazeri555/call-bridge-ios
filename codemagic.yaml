@@ -15,13 +15,12 @@ workflows:
         script: |
           set -e
           cd CallBridge
-          xcodebuild -project CallBridge.xcodeproj -scheme CallBridge \
-            -configuration Release -destination 'generic/platform=iOS' \
-            -archivePath ../build/CallBridge.xcarchive archive \
+          xcodebuild -project CallBridge.xcodeproj -target CallBridge \
+            -configuration Release -sdk iphoneos build SYMROOT=../build \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
           cd ..
           mkdir -p build/Payload
-          cp -r build/CallBridge.xcarchive/Products/Applications/*.app build/Payload/
+          cp -r build/Release-iphoneos/CallBridge.app build/Payload/
           cd build && zip -qry CallBridge.ipa Payload
     artifacts:
       - build/CallBridge.ipa
