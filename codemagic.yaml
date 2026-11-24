@@ -21,9 +21,11 @@ workflows:
           fi
           xcodegen --version
       - name: Generate Xcode project
-        script: xcodegen generate
+        script: |
+          cd CallBridge && xcodegen generate
       - name: Build unsigned IPA
         script: |
+          cd CallBridge
           xcodebuild -project CallBridge.xcodeproj -scheme CallBridge \
             -configuration Release -destination 'generic/platform=iOS' \
             -archivePath build/CallBridge.xcarchive archive \
