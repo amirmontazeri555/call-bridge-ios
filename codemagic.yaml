@@ -15,10 +15,11 @@ workflows:
     scripts:
       - name: Install XcodeGen
         script: |
-          curl -sL "https://github.com/yonaskolb/XcodeGen/releases/download/2.43.0/xcodegen.2.43.0.zip" -o xg.zip
-          unzip -q xg.zip
-          sudo cp xcodegen/bin/xcodegen /usr/local/bin/
-          xcodegen --version || true
+          set -e
+          if ! command -v xcodegen >/dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen --version
       - name: Generate Xcode project
         script: xcodegen generate
       - name: Build unsigned IPA
