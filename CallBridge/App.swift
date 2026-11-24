@@ -1,7 +1,9 @@
 import SwiftUI
+import CallKit
 
-// call-bridge iOS: connects to the Windows relay (ws://<ip>:9877)
-// and shows incoming call events from the Android phone.
+// TwinCall iOS: connects to the Windows relay (ws://<ip>:9877),
+// reports incoming SIM calls as real CallKit calls, and sends
+// ANSWER/END back over the same WS (relay forwards via UDP to Android).
 
 struct CallEvent: Codable {
     let event: String
@@ -9,17 +11,99 @@ struct CallEvent: Codable {
     let number: String?
     let state: String?
     let id: String?
+    let sim: String? // reserved for dual-SIM: "sim1"/"sim2" label from Android
 }
+
+// MARK: - CallKit bridge
+
+final class CallKitBridge: NSObject, CXProviderDelegate {
+    let provider: CXProvider
+    let callController = CXCallController()
+    var onCommand: ((String) -> Void)? // sends JSON over WS to the relay
+
+    private var activeCallUUID: UUID?
+
+    override init() {
+        let cfg = CXProviderConfiguration(localizedName: "TwinCall")
+        cfg.supportsVideo = false
+        cfg.maximumCallGroups = 1
+        cfg.maximumCallsPerCallGroup = 1
+        provider = CXProvider(configuration: cfg)
+        super.init()
+        provider.setDelegate(self, queue: nil)
+    }
+
+    func reportIncoming(number: String, sim: String?) {
+        // one live bridge-call at a time; end any previous one
+        if let uuid = activeCallUUID {
+            provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+            activeCallUUID = nil
+        }
+        let uuid = UUID()
+        activeCallUUID = uuid
+        let handle = CXHandle(type: .phoneNumber, value: number)
+        let update = CXCallUpdate()
+        update.remoteHandle = handle
+        update.hasVideo = false
+        if let sim, !sim.isEmpty {
+            update.localizedCallerName = sim // e.g. "سیم ۱ — ۰۹۱۲…"
+        }
+        provider.reportNewIncomingCall(with: uuid, update: update) { [weak self] error in
+            if let error { print("CallKit report failed: \(error)") }
+        }
+    }
+
+    func endActive(reason: CXCallEndedReason = .remoteEnded) {
+        if let uuid = activeCallUUID {
+            provider.reportCall(with: uuid, endedAt: Date(), reason: reason)
+            activeCallUUID = nil
+        }
+    }
+
+    // MARK: CXProviderDelegate — user taps CallKit UI
+
+    func providerDidReset(_ provider: CXProvider) {
+        activeCallUUID = nil
+    }
+
+    func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+        onCommand?(Self.json("ANSWER"))
+        action.fulfill()
+    }
+
+    func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+        onCommand?(Self.json("END"))
+        endActive(reason: .declinedElsewhere)
+        action.fulfill()
+    }
+
+    func provider(_ provider: CXProvider, timedOutPerforming action: CXAnswerCallAction) {
+        onCommand?(Self.json("MISSED"))
+        action.fulfill()
+    }
+
+    private static func json(_ cmd: String) -> String {
+        "{\"cmd\":\"\(cmd)\"}"
+    }
+}
+
+// MARK: - Store
 
 final class CallStore: ObservableObject {
     @Published var serverIP: String = UserDefaults.standard.string(forKey: "server_ip") ?? ""
     @Published var status: String = "متصل نیست"
     @Published var connected = false
-    @Published var incomingNumber: String? = nil
     @Published var events: [String] = []
 
     private var task: URLSessionWebSocketTask?
     private var pingTimer: Timer?
+    private let bridge = CallKitBridge()
+
+    init() {
+        bridge.onCommand = { [weak self] json in
+            self?.sendRaw(json)
+        }
+    }
 
     func connect() {
         disconnect()
@@ -43,12 +127,19 @@ final class CallStore: ObservableObject {
         pingTimer?.invalidate()
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
+        bridge.endActive()
         markDown()
     }
 
     private func markDown() {
         connected = false
         status = "متصل نیست"
+    }
+
+    private func sendRaw(_ text: String) {
+        task?.send(.string(text)) { error in
+            if let error { print("WS send failed: \(error)") }
+        }
     }
 
     private func receive() {
@@ -69,49 +160,38 @@ final class CallStore: ObservableObject {
     private func handle(_ text: String) {
         connected = true
         status = "متصل ✅"
-        let display: String
         if let data = text.data(using: .utf8),
            let ev = try? JSONDecoder().decode(CallEvent.self, from: data) {
-            if ev.event == "CALL_ADDED", ev.state == "RINGING" {
-                incomingNumber = ev.number
+            if ev.event == "CALL_ADDED", ev.state == "RINGING", let num = ev.number {
+                bridge.reportIncoming(number: num, sim: ev.sim)
             }
-            if ev.state == "DISCONNECTED" {
-                incomingNumber = nil
+            if ev.state == "DISCONNECTED" || ev.state == "ACTIVE" {
+                bridge.endActive()
             }
-            display = "\(ev.event) \(ev.number ?? "") \(ev.state ?? "")"
+            log("\(ev.event) \(ev.number ?? "") \(ev.state ?? "") \(ev.sim ?? "")")
         } else {
-            display = text
+            log(text)
         }
-        events.insert("\(Date().formatted(date: .omitted, time: .standard)) — \(display)", at: 0)
+    }
+
+    private func log(_ line: String) {
+        events.insert("\(Date().formatted(date: .omitted, time: .standard)) — \(line)", at: 0)
         if events.count > 50 { events.removeLast(events.count - 50) }
     }
 }
+
+// MARK: - UI
 
 struct ContentView: View {
     @StateObject private var store = CallStore()
 
     var body: some View {
         VStack(spacing: 16) {
-            if let num = store.incomingNumber {
-                VStack(spacing: 8) {
-                    Text("📞 تماس ورودی")
-                        .font(.largeTitle).bold()
-                    Text(num)
-                        .font(.title)
-                        .textSelection(.enabled)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(24)
-                .background(Color.red.opacity(0.85))
-                .foregroundStyle(.white)
-                .cornerRadius(20)
-                .padding(.horizontal)
-            }
             Text(store.status)
                 .foregroundStyle(store.connected ? .green : .secondary)
 
             HStack {
-                TextField("IP ویندوز، مثل 192.168.1.5", text: $store.serverIP)
+                TextField("IP رله، مثل 192.168.100.42", text: $store.serverIP)
                     .keyboardType(.decimalPad)
                     .textFieldStyle(.roundedBorder)
                 Button("اتصال") { store.connect() }
@@ -121,7 +201,7 @@ struct ContentView: View {
 
             List(store.events, id: \.self) { Text($0).font(.caption) }
             if store.events.isEmpty {
-                Text("هنوز رویدادی نرسیده.\nروی ویندوز: python relay.py")
+                Text("تماس‌ها به‌صورت CallKit واقعی زنگ می‌زنند.\nروی ویندوز: python relay.py")
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 Spacer()
