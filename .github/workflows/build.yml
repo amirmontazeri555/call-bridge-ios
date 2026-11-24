@@ -4,14 +4,28 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
 jobs:
   build:
-    runs-on: macos-13
+    # two runners = two tickets in the macOS queue; first to land wins
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-13, macos-14]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install XcodeGen
-        run: brew install xcodegen
+        run: |
+          if [ "$(uname -m)" = "arm64" ]; then ARCH="arm64"; else ARCH="x86_64"; fi
+          curl -sL "https://github.com/yonaskolb/XcodeGen/releases/download/2.43.0/xcodegen.2.43.0.zip" -o xg.zip
+          unzip -q xg.zip
+          sudo cp xcodegen/bin/xcodegen /usr/local/bin/
+          xcodegen --version || true
 
       - name: Generate Xcode project
         run: xcodegen generate
@@ -29,5 +43,5 @@ jobs:
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CallBridge-ipa
+          name: CallBridge-ipa-${{ matrix.runner }}
           path: build/CallBridge.ipa
