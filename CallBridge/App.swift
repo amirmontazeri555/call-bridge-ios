@@ -1,9 +1,13 @@
 import SwiftUI
 import CallKit
+import UserNotifications
+import AVFoundation
+import AudioToolbox
 
-// TwinCall iOS: connects to the Windows relay (ws://<ip>:9877),
-// reports incoming SIM calls as real CallKit calls, and sends
-// ANSWER/END back over the same WS (relay forwards via UDP to Android).
+// TwinCall iOS: connects to the Windows relay (ws://<ip>:9877) and reports
+// incoming SIM calls. CallKit first (works with a paid dev account);
+// on entitlement error -> fallback: app-placed ringing + lock-screen
+// notification with Answer/Decline actions. Commands go back over WS.
 
 struct CallEvent: Codable {
     let event: String
@@ -11,83 +15,189 @@ struct CallEvent: Codable {
     let number: String?
     let state: String?
     let id: String?
-    let sim: String? // reserved for dual-SIM: "sim1"/"sim2" label from Android
+    let sim: String? // dual-SIM label from Android, e.g. "سیم ۱"
 }
 
-// MARK: - CallKit bridge
+// MARK: - Ringer (fallback sound + vibration)
 
-final class CallKitBridge: NSObject, CXProviderDelegate {
-    let provider: CXProvider
-    let callController = CXCallController()
-    var onCommand: ((String) -> Void)? // sends JSON over WS to the relay
-    var onLog: ((String) -> Void)?    // surfaces errors in the app UI
+final class Ringer: NSObject {
+    private var player: AVAudioPlayer?
+    private var vibeTimer: Timer?
 
-    private var activeCallUUID: UUID?
+    func start() {
+        try? AVAudioSession.sharedInstance().setCategory(.playback, options: [.mixWithOthers])
+        try? AVAudioSession.sharedInstance().setActive(true)
+        // generate a ring tone programmatically (no asset needed)
+        player = makeTonePlayer()
+        player?.numberOfLoops = -1
+        player?.play()
+        vibeTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { _ in
+            AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
+        }
+    }
 
-    override init() {
+    func stop() {
+        player?.stop()
+        player = nil
+        vibeTimer?.invalidate()
+        vibeTimer = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    private func makeTonePlayer() -> AVAudioPlayer? {
+        // two-tone ring pattern, 1.5s loop, generated in memory
+        let sampleRate = 22050.0
+        let dur = 1.5
+        let n = Int(sampleRate * dur)
+        var samples = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            let t = Double(i) / sampleRate
+            let f = (Int(t / 0.4) % 2 == 0) ? 440.0 : 480.0 // alternating tones
+            let env = (t.truncatingRemainder(dividingBy: 0.4) < 0.3) ? 1.0 : 0.0 // pause between bursts
+            samples[i] = env * 0.25 * Float(sin(2 * .pi * f * t))
+        }
+        var data = Data()
+        // minimal WAV header (PCM 16-bit mono)
+        func le32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        func le16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: "RIFF".utf8); le32(UInt32(36 + n * 2)); data.append(contentsOf: "WAVE".utf8)
+        data.append(contentsOf: "fmt ".utf8); le32(16); le16(1); le16(1); le32(UInt32(sampleRate))
+        le32(UInt32(sampleRate) * 2); le16(2); le16(16)
+        data.append(contentsOf: "data".utf8); le32(UInt32(n * 2))
+        for s in samples { le16(UInt16(Int16(max(-1, min(1, s))) * Int16(Int16.max))) }
+        return try? AVAudioPlayer(data: data, fileTypeHint: AVFileType.wav.rawValue)
+    }
+}
+
+// MARK: - Incoming call handling (CallKit + fallback)
+
+final class IncomingCallCenter: NSObject, CXProviderDelegate, UNUserNotificationCenterDelegate {
+    let provider = CXProvider(configuration: {
         let cfg = CXProviderConfiguration(localizedName: "TwinCall")
         cfg.supportsVideo = false
         cfg.maximumCallGroups = 1
         cfg.maximumCallsPerCallGroup = 1
         cfg.supportedHandleTypes = [.phoneNumber]
-        provider = CXProvider(configuration: cfg)
+        return cfg
+    }())
+    var onCommand: ((String) -> Void)?
+    var onLog: ((String) -> Void)?
+    var onFallbackRing: (() -> Void)?
+    var onFallbackStop: (() -> Void)?
+
+    private var activeCallUUID: UUID?
+    private var currentNumber: String?
+    private var callKitOK = false // flips true after one successful report
+
+    override init() {
         super.init()
         provider.setDelegate(self, queue: nil)
+        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
+    // MARK: incoming event
+
     func reportIncoming(number: String, sim: String?) {
-        // one live bridge-call at a time; end any previous one
-        if let uuid = activeCallUUID {
-            provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
-            activeCallUUID = nil
-        }
+        currentNumber = number
         let uuid = UUID()
         activeCallUUID = uuid
-        let handle = CXHandle(type: .phoneNumber, value: number)
         let update = CXCallUpdate()
-        update.remoteHandle = handle
+        update.remoteHandle = CXHandle(type: .phoneNumber, value: number)
         update.hasVideo = false
-        if let sim, !sim.isEmpty {
-            update.localizedCallerName = sim // e.g. "سیم ۱ — ۰۹۱۲…"
-        }
+        if let sim, !sim.isEmpty { update.localizedCallerName = sim }
         provider.reportNewIncomingCall(with: uuid, update: update) { [weak self] error in
+            guard let self else { return }
             if let error {
-                self?.onLog?("⚠️ CallKit: \(error.localizedDescription)")
+                self.onLog?("⚠️ CallKit: \(error.localizedDescription) — fallback")
+                self.callKitOK = false
+                self.activeCallUUID = nil
+                self.fallbackNotify(number: number, sim: sim)
+                self.onFallbackRing?()
+            } else {
+                self.callKitOK = true
             }
         }
     }
 
-    func endActive(reason: CXCallEndedReason = .remoteEnded) {
-        if let uuid = activeCallUUID {
-            provider.reportCall(with: uuid, endedAt: Date(), reason: reason)
-            activeCallUUID = nil
+    func eventEnded() {
+        if callKitOK, let uuid = activeCallUUID {
+            provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
         }
-    }
-
-    // MARK: CXProviderDelegate — user taps CallKit UI
-
-    func providerDidReset(_ provider: CXProvider) {
         activeCallUUID = nil
+        stopFallback()
     }
+
+    // MARK: fallback: notification + in-app ringing
+
+    private func fallbackNotify(number: String, sim: String?) {
+        let content = UNMutableNotificationContent()
+        content.title = "📞 تماس ورودی"
+        content.body = sim?.isEmpty == false ? "\(number) — \(sim!)" : number
+        content.sound = .default
+        content.categoryIdentifier = "INCOMING"
+        content.userInfo = ["number": number]
+        let req = UNNotificationRequest(identifier: "incoming", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+    }
+
+    private func stopFallback() {
+        onFallbackStop?()
+        UNUserNotificationCenter.current().removeDeliveredNotification(
+            withIdentifiers: ["incoming"])
+        UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+    }
+
+    // MARK: notification actions (Answer / Decline)
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if response.actionIdentifier == "ANSWER" {
+            onCommand?(commandJSON("ANSWER"))
+            stopFallback()
+        } else if response.actionIdentifier == "END"
+                    || response.actionIdentifier == UNNotificationDismissActionIdentifier {
+            onCommand?(commandJSON("END"))
+            stopFallback()
+        }
+        completionHandler()
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    static func registerCategories() {
+        let answer = UNNotificationAction(identifier: "ANSWER", title: "پاسخ")
+        let end = UNNotificationAction(identifier: "END", title: "قطع")
+        let cat = UNNotificationCategory(identifier: "INCOMING", actions: [answer, end], intentIdentifiers: [])
+        UNUserNotificationCenter.current().setNotificationCategories([cat])
+    }
+
+    // MARK: CXProviderDelegate (used when CallKit works)
+
+    func providerDidReset(_ provider: CXProvider) { activeCallUUID = nil }
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
-        onCommand?(Self.json("ANSWER"))
+        onCommand?(commandJSON("ANSWER"))
         action.fulfill()
     }
 
     func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
-        onCommand?(Self.json("END"))
-        endActive(reason: .declinedElsewhere)
+        onCommand?(commandJSON("END"))
         action.fulfill()
     }
 
     func provider(_ provider: CXProvider, timedOutPerforming action: CXAnswerCallAction) {
-        onCommand?(Self.json("MISSED"))
+        onCommand?(commandJSON("MISSED"))
         action.fulfill()
     }
 
-    private static func json(_ cmd: String) -> String {
-        "{\"cmd\":\"\(cmd)\"}"
+    private func commandJSON(_ cmd: String) -> String {
+        "{\"cmd\":\"\(cmd)\",\"number\":\"\(currentNumber ?? "")\"}"
     }
 }
 
@@ -101,15 +211,15 @@ final class CallStore: ObservableObject {
 
     private var task: URLSessionWebSocketTask?
     private var pingTimer: Timer?
-    private let bridge = CallKitBridge()
+    private let center = IncomingCallCenter()
+    private let ringer = Ringer()
 
     init() {
-        bridge.onCommand = { [weak self] json in
-            self?.sendRaw(json)
-        }
-        bridge.onLog = { [weak self] line in
-            self?.log(line)
-        }
+        center.onCommand = { [weak self] json in self?.sendRaw(json) }
+        center.onLog = { [weak self] line in self?.log(line) }
+        center.onFallbackRing = { [weak self] in self?.ringer.start() }
+        center.onFallbackStop = { [weak self] in self?.ringer.stop() }
+        IncomingCallCenter.registerCategories()
     }
 
     func connect() {
@@ -134,7 +244,7 @@ final class CallStore: ObservableObject {
         pingTimer?.invalidate()
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
-        bridge.endActive()
+        center.eventEnded()
         markDown()
     }
 
@@ -170,10 +280,10 @@ final class CallStore: ObservableObject {
         if let data = text.data(using: .utf8),
            let ev = try? JSONDecoder().decode(CallEvent.self, from: data) {
             if ev.event == "CALL_ADDED", ev.state == "RINGING", let num = ev.number {
-                bridge.reportIncoming(number: num, sim: ev.sim)
+                center.reportIncoming(number: num, sim: ev.sim)
             }
             if ev.state == "DISCONNECTED" || ev.state == "ACTIVE" {
-                bridge.endActive()
+                center.eventEnded()
             }
             log("\(ev.event) \(ev.number ?? "") \(ev.state ?? "") \(ev.sim ?? "")")
         } else {
@@ -208,7 +318,7 @@ struct ContentView: View {
 
             List(store.events, id: \.self) { Text($0).font(.caption) }
             if store.events.isEmpty {
-                Text("تماس‌ها به‌صورت CallKit واقعی زنگ می‌زنند.\nروی ویندوز: python relay.py")
+                Text("تماس‌ها زنگ می‌خورند (CallKit یا اعلان).\nروی ویندوز: python relay.py")
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 Spacer()
