@@ -54,7 +54,8 @@ final class Ringer: NSObject {
             let t = Double(i) / sampleRate
             let f = (Int(t / 0.4) % 2 == 0) ? 440.0 : 480.0 // alternating tones
             let env = (t.truncatingRemainder(dividingBy: 0.4) < 0.3) ? 1.0 : 0.0 // pause between bursts
-            samples[i] = env * 0.25 * Float(sin(2 * .pi * f * t))
+            let wave = Float(sin(2.0 * Double.pi * f * t))
+            samples[i] = Float(env) * 0.25 * wave
         }
         var data = Data()
         // minimal WAV header (PCM 16-bit mono)
@@ -143,9 +144,9 @@ final class IncomingCallCenter: NSObject, CXProviderDelegate, UNUserNotification
 
     private func stopFallback() {
         onFallbackStop?()
-        UNUserNotificationCenter.current().removeDeliveredNotification(
-            withIdentifiers: ["incoming"])
-        UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+        let nc = UNUserNotificationCenter.current()
+        nc.removeDeliveredNotifications(withIdentifiers: ["incoming"])
+        nc.removeAllPendingNotificationRequests()
     }
 
     // MARK: notification actions (Answer / Decline)
