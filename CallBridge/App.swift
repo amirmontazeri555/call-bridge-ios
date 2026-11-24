@@ -87,7 +87,7 @@ final class IncomingCallCenter: NSObject, CXProviderDelegate, UNUserNotification
     var onFallbackStop: (() -> Void)?
 
     private var activeCallUUID: UUID?
-    private var currentNumber: String?
+    var currentNumber: String?
     private var callKitOK = false // flips true after one successful report
 
     override init() {
@@ -209,6 +209,7 @@ final class CallStore: ObservableObject {
     @Published var status: String = "متصل نیست"
     @Published var connected = false
     @Published var events: [String] = []
+    @Published var incomingNumber: String? = nil // in-app ringing card (fallback)
 
     private var task: URLSessionWebSocketTask?
     private var pingTimer: Timer?
@@ -218,8 +219,14 @@ final class CallStore: ObservableObject {
     init() {
         center.onCommand = { [weak self] json in self?.sendRaw(json) }
         center.onLog = { [weak self] line in self?.log(line) }
-        center.onFallbackRing = { [weak self] in self?.ringer.start() }
-        center.onFallbackStop = { [weak self] in self?.ringer.stop() }
+        center.onFallbackRing = { [weak self] in
+            self?.incomingNumber = self?.center.currentNumber
+            self?.ringer.start()
+        }
+        center.onFallbackStop = { [weak self] in
+            self?.incomingNumber = nil
+            self?.ringer.stop()
+        }
         IncomingCallCenter.registerCategories()
     }
 
@@ -292,6 +299,19 @@ final class CallStore: ObservableObject {
         }
     }
 
+    // in-app fallback buttons
+    func answerIncoming() {
+        sendRaw("{\"cmd\":\"ANSWER\",\"number\":\"\(center.currentNumber ?? "")\"}")
+        incomingNumber = nil
+        ringer.stop()
+    }
+
+    func endIncoming() {
+        sendRaw("{\"cmd\":\"END\",\"number\":\"\(center.currentNumber ?? "")\"}")
+        incomingNumber = nil
+        ringer.stop()
+    }
+
     private func log(_ line: String) {
         events.insert("\(Date().formatted(date: .omitted, time: .standard)) — \(line)", at: 0)
         if events.count > 50 { events.removeLast(events.count - 50) }
@@ -305,6 +325,38 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 16) {
+            if let num = store.incomingNumber {
+                VStack(spacing: 12) {
+                    Text("📞 تماس ورودی").font(.largeTitle).bold()
+                    Text(num).font(.title).textSelection(.enabled)
+                    HStack(spacing: 24) {
+                        Button {
+                            store.answerIncoming()
+                        } label: {
+                            Text("پاسخ").font(.title2).bold()
+                                .frame(width: 100, height: 60)
+                                .background(Color.green)
+                                .foregroundStyle(.white)
+                                .clipShape(Capsule())
+                        }
+                        Button {
+                            store.endIncoming()
+                        } label: {
+                            Text("قطع").font(.title2).bold()
+                                .frame(width: 100, height: 60)
+                                .background(Color.red)
+                                .foregroundStyle(.white)
+                                .clipShape(Capsule())
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(24)
+                .background(Color.red.opacity(0.85))
+                .foregroundStyle(.white)
+                .cornerRadius(20)
+                .padding(.horizontal)
+            }
             Text(store.status)
                 .foregroundStyle(store.connected ? .green : .secondary)
 
