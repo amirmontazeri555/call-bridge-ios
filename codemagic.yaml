@@ -30,6 +30,5 @@ workflows:
           mkdir -p build/Payload
           cp -r build/CallBridge.xcarchive/Products/Applications/*.app build/Payload/
           cd build && zip -qry CallBridge.ipa Payload
-    publishing:
-      artifacts:
-        - build/CallBridge.ipa
+    artifacts:
+      - build/CallBridge.ipa
