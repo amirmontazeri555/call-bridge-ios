@@ -20,6 +20,7 @@ final class CallKitBridge: NSObject, CXProviderDelegate {
     let provider: CXProvider
     let callController = CXCallController()
     var onCommand: ((String) -> Void)? // sends JSON over WS to the relay
+    var onLog: ((String) -> Void)?    // surfaces errors in the app UI
 
     private var activeCallUUID: UUID?
 
@@ -28,6 +29,7 @@ final class CallKitBridge: NSObject, CXProviderDelegate {
         cfg.supportsVideo = false
         cfg.maximumCallGroups = 1
         cfg.maximumCallsPerCallGroup = 1
+        cfg.supportedHandleTypes = [.phoneNumber]
         provider = CXProvider(configuration: cfg)
         super.init()
         provider.setDelegate(self, queue: nil)
@@ -49,7 +51,9 @@ final class CallKitBridge: NSObject, CXProviderDelegate {
             update.localizedCallerName = sim // e.g. "سیم ۱ — ۰۹۱۲…"
         }
         provider.reportNewIncomingCall(with: uuid, update: update) { [weak self] error in
-            if let error { print("CallKit report failed: \(error)") }
+            if let error {
+                self?.onLog?("⚠️ CallKit: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -102,6 +106,9 @@ final class CallStore: ObservableObject {
     init() {
         bridge.onCommand = { [weak self] json in
             self?.sendRaw(json)
+        }
+        bridge.onLog = { [weak self] line in
+            self?.log(line)
         }
     }
 
