@@ -336,6 +336,7 @@ final class CallStore: ObservableObject {
         guard !ip.isEmpty else { status = "آدرس سرور را وارد کن"; return }
         guard let url = URL(string: "ws://\(ip):9877") else { status = "آدرس نامعتبر"; return }
         UserDefaults.standard.set(ip, forKey: "server_ip")
+        status = ip == "192.168.22.178" ? "اتصال به گوشی اندروید…" : "در حال اتصال به \(ip)…"
         status = "در حال اتصال به \(ip)…"
         let t = URLSession.shared.webSocketTask(with: url)
         task = t
