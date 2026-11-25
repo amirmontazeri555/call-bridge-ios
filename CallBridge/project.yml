@@ -12,7 +12,7 @@ targets:
       path: CallBridge/Info.plist
       properties:
         UILaunchScreen: {}
-        UIBackgroundModes: [voip]
+        UIBackgroundModes: [voip, audio]
         NSLocalNetworkUsageDescription: "برای دریافت تماس‌های رله از Wi-Fi خانه"
         NSBonjourServices: []
     settings:

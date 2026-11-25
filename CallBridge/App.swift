@@ -70,6 +70,41 @@ final class Ringer: NSObject {
     }
 }
 
+// MARK: - Background keep-alive (free-account substitute for VoIP push)
+
+/// Silent looping player: keeps the process alive in background so the WS
+/// socket survives and CallKit can still ring for Android-side calls.
+final class KeepAlive {
+    private var player: AVAudioPlayer?
+
+    func start() {
+        guard player == nil else { return }
+        try? AVAudioSession.sharedInstance().setCategory(.playback, options: [.mixWithOthers])
+        try? AVAudioSession.sharedInstance().setActive(true)
+        // 2s of silence, looped
+        let sampleRate = 22050.0
+        let n = Int(sampleRate * 2)
+        var data = Data()
+        func le32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        func le16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: "RIFF".utf8); le32(UInt32(36 + n * 2)); data.append(contentsOf: "WAVE".utf8)
+        data.append(contentsOf: "fmt ".utf8); le32(16); le16(1); le16(1); le32(UInt32(sampleRate))
+        le32(UInt32(sampleRate) * 2); le16(2); le16(16)
+        data.append(contentsOf: "data".utf8); le32(UInt32(n * 2))
+        data.append(contentsOf: [UInt8](repeating: 0, count: n * 2))
+        player = try? AVAudioPlayer(data: data, fileTypeHint: AVFileType.wav.rawValue)
+        player?.numberOfLoops = -1
+        player?.volume = 0.01 // iOS kills true-zero-volume loops; near-silence passes
+        player?.play()
+    }
+
+    func stop() {
+        player?.stop()
+        player = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+}
+
 // MARK: - Incoming call handling (CallKit + fallback)
 
 final class IncomingCallCenter: NSObject, CXProviderDelegate, UNUserNotificationCenterDelegate {
@@ -216,6 +251,7 @@ final class CallStore: ObservableObject {
     private var reconnectTimer: Timer?
     private let center = IncomingCallCenter()
     private let ringer = Ringer()
+    private let keepAlive = KeepAlive()
 
     init() {
         center.onCommand = { [weak self] json in self?.sendRaw(json) }
@@ -243,6 +279,7 @@ final class CallStore: ObservableObject {
         t.resume()
         status = "متصل ✅"
         connected = true
+        keepAlive.start()
         receive()
         pingTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.task?.sendPing { error in
@@ -258,6 +295,7 @@ final class CallStore: ObservableObject {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         center.eventEnded()
+        keepAlive.stop()
         markDown()
     }
 
