@@ -96,6 +96,17 @@ final class KeepAlive {
         player?.numberOfLoops = -1
         player?.volume = 0.01 // iOS kills true-zero-volume loops; near-silence passes
         player?.play()
+        // A cellular call on this iPhone interrupts our session; resume when it ends
+        // so the process stays alive and the WS socket survives.
+        NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification,
+                                               object: nil, queue: .main) { [weak self] note in
+            guard let self,
+                  let info = note.userInfo,
+                  (info[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.ended.rawValue
+            else { return }
+            try? AVAudioSession.sharedInstance().setActive(true)
+            self.player?.play()
+        }
     }
 
     func stop() {
