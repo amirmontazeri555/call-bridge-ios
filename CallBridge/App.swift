@@ -240,6 +240,8 @@ final class CallStore: ObservableObject {
         let t = URLSession.shared.webSocketTask(with: url)
         task = t
         t.resume()
+        status = "متصل ✅"
+        connected = true
         receive()
         pingTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.task?.sendPing { error in
