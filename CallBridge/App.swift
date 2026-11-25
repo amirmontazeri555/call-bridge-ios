@@ -213,6 +213,7 @@ final class CallStore: ObservableObject {
 
     private var task: URLSessionWebSocketTask?
     private var pingTimer: Timer?
+    private var reconnectTimer: Timer?
     private let center = IncomingCallCenter()
     private let ringer = Ringer()
 
@@ -251,6 +252,8 @@ final class CallStore: ObservableObject {
     }
 
     func disconnect() {
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
         pingTimer?.invalidate()
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
@@ -260,7 +263,19 @@ final class CallStore: ObservableObject {
 
     private func markDown() {
         connected = false
-        status = "متصل نیست"
+        status = "اتصال قطع شد — تلاش مجدد…"
+        scheduleReconnect()
+    }
+
+    /// Auto-reconnect: when the socket dies (relay restart, Wi-Fi drop, sleep),
+    /// retry every 3s until connect() succeeds again. UI stays honest meanwhile.
+    private func scheduleReconnect() {
+        guard reconnectTimer == nil, !serverIP.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
+            guard let self, self.task == nil else { return }
+            self.reconnectTimer = nil
+            self.connect()
+        }
     }
 
     private func sendRaw(_ text: String) {
@@ -274,7 +289,10 @@ final class CallStore: ObservableObject {
             guard let self else { return }
             switch result {
             case .failure:
-                DispatchQueue.main.async { self.markDown() }
+                DispatchQueue.main.async {
+                    self.task = nil // dead socket: let reconnect take over
+                    self.markDown()
+                }
             case .success(let msg):
                 if case .string(let text) = msg {
                     DispatchQueue.main.async { self.handle(text) }
