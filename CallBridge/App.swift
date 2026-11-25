@@ -124,6 +124,7 @@ final class PCMPlayer {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let format: AVAudioFormat
+    private var restarted = false // engine died mid-call once already?
 
     init?() {
         guard let f = AVAudioFormat(commonFormat: .pcmFormatInt16,
@@ -132,16 +133,28 @@ final class PCMPlayer {
         format = f
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
+        // Log session/engine errors loudly — silent failure here is why audio
+        // never played even though frames arrived.
+        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                object: engine, queue: .main) { [weak self] _ in
+            print("PCMPlayer: engine configuration changed — restarting")
+            self?.restarted = false
+            self?.start()
+        }
     }
 
     func start() {
         guard !engine.isRunning else { return }
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playAndRecord,
-                    options: [.mixWithOthers, .defaultToSpeaker])
-            try AVAudioSession.sharedInstance().setActive(true)
+            let session = AVAudioSession.sharedInstance()
+            // .playback (not playAndRecord): we only PLAY on the iPhone. The
+            // record category can fail activation while another app (CallKit)
+            // holds the session — the actual cause of silent playback.
+            try session.setCategory(.playback, options: [.defaultToSpeaker])
+            try session.setActive(true)
             try engine.start()
             player.play()
+            print("PCMPlayer: started, sr=\(session.sampleRate)")
         } catch {
             print("PCMPlayer start failed: \(error)")
         }
@@ -149,7 +162,16 @@ final class PCMPlayer {
 
     /// feed one 100ms datagram of int16 mono PCM
     func feed(_ data: Data) {
-        guard engine.isRunning, data.count >= 2 else { return }
+        if !engine.isRunning {
+            // Session may have been deactivated mid-call (interruption, route
+            // change): retry activation here instead of dropping every frame.
+            if restarted { return }
+            restarted = true
+            print("PCMPlayer: engine not running in feed() — recovering")
+            start()
+            guard engine.isRunning else { return }
+        }
+        guard data.count >= 2 else { return }
         let frames = AVAudioFrameCount(data.count / 2)
         guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
         buf.frameLength = frames
@@ -163,6 +185,7 @@ final class PCMPlayer {
     func stop() {
         player.stop()
         engine.stop()
+        restarted = false
     }
 }
 
