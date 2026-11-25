@@ -447,6 +447,9 @@ struct ContentView: View {
             }
         }
         .padding(.top)
+        Spacer()
+        Text("بیلد \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?") · \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+            .font(.caption2).foregroundStyle(.tertiary)
     }
 }
 
