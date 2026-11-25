@@ -116,6 +116,56 @@ final class KeepAlive {
     }
 }
 
+// MARK: - Live call audio (Phase 2): raw PCM over WS binary frames
+
+/// Plays the PCM audio fanned out by the relay (Android's in-call stream).
+/// WS binary frames are 100ms of 8kHz mono 16-bit PCM.
+final class PCMPlayer {
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private let format: AVAudioFormat
+
+    init?() {
+        guard let f = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                    sampleRate: 8000, channels: 1, interleaved: true)
+        else { return nil }
+        format = f
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+    }
+
+    func start() {
+        guard !engine.isRunning else { return }
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playAndRecord,
+                    options: [.mixWithOthers, .defaultToSpeaker])
+            try AVAudioSession.sharedInstance().setActive(true)
+            try engine.start()
+            player.play()
+        } catch {
+            print("PCMPlayer start failed: \(error)")
+        }
+    }
+
+    /// feed one 100ms datagram of int16 mono PCM
+    func feed(_ data: Data) {
+        guard engine.isRunning, data.count >= 2 else { return }
+        let frames = AVAudioFrameCount(data.count / 2)
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+        buf.frameLength = frames
+        data.withUnsafeBytes { raw in
+            let dst = buf.mutableAudioBufferList.pointee.mBuffers.mData!
+            dst.copyMemory(from: raw.baseAddress!, byteCount: data.count)
+        }
+        player.scheduleBuffer(buf)
+    }
+
+    func stop() {
+        player.stop()
+        engine.stop()
+    }
+}
+
 // MARK: - Incoming call handling (CallKit + fallback)
 
 final class IncomingCallCenter: NSObject, CXProviderDelegate, UNUserNotificationCenterDelegate {
@@ -264,6 +314,7 @@ final class CallStore: ObservableObject {
     private let center = IncomingCallCenter()
     private let ringer = Ringer()
     private let keepAlive = KeepAlive()
+    private var pcm: PCMPlayer?
 
     init() {
         center.onCommand = { [weak self] json in self?.sendRaw(json) }
@@ -307,6 +358,8 @@ final class CallStore: ObservableObject {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         center.eventEnded()
+        pcm?.stop()
+        pcm = nil
         keepAlive.stop()
         markDown()
     }
@@ -344,8 +397,13 @@ final class CallStore: ObservableObject {
                     self.markDown()
                 }
             case .success(let msg):
-                if case .string(let text) = msg {
+                switch msg {
+                case .string(let text):
                     DispatchQueue.main.async { self.handle(text) }
+                case .data(let pcmData):
+                    DispatchQueue.main.async { self.pcm?.feed(pcmData) }
+                @unknown default:
+                    break
                 }
                 self.receive()
             }
@@ -361,6 +419,11 @@ final class CallStore: ObservableObject {
                 center.reportIncoming(number: num, sim: ev.sim)
             }
             if ev.state == "DISCONNECTED" || ev.state == "ACTIVE" || ev.event == "CALL_REMOVED" {
+                if ev.state == "ACTIVE" || ev.event == "CALL_ADDED" && ev.state != "RINGING" {
+                    // call answered somewhere: open the audio channel
+                    if pcm == nil { pcm = PCMPlayer() }
+                    pcm?.start()
+                }
                 center.eventEnded()
             }
             log("\(ev.event) \(ev.number ?? "") \(ev.state ?? "") \(ev.sim ?? "")")
