@@ -172,6 +172,7 @@ final class IncomingCallCenter: NSObject, CXProviderDelegate, UNUserNotification
             provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
         }
         activeCallUUID = nil
+        currentNumber = nil
         stopFallback()
     }
 
@@ -359,7 +360,7 @@ final class CallStore: ObservableObject {
             if ev.event == "CALL_ADDED", ev.state == "RINGING", let num = ev.number {
                 center.reportIncoming(number: num, sim: ev.sim)
             }
-            if ev.state == "DISCONNECTED" || ev.state == "ACTIVE" {
+            if ev.state == "DISCONNECTED" || ev.state == "ACTIVE" || ev.event == "CALL_REMOVED" {
                 center.eventEnded()
             }
             log("\(ev.event) \(ev.number ?? "") \(ev.state ?? "") \(ev.sim ?? "")")
